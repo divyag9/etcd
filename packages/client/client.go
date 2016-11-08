@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/coreos/etcd/client"
@@ -31,6 +31,9 @@ type Client struct {
 //GetEndpoints returns list of end points retrieved from srv record
 func (c *Client) GetEndpoints(service, proto, domain string) (err error) {
 	_, addrs, err := net.LookupSRV(service, proto, domain)
+	if err != nil {
+		return
+	}
 	var urls []*url.URL
 	for _, srv := range addrs {
 		urls = append(urls, &url.URL{
@@ -41,27 +44,38 @@ func (c *Client) GetEndpoints(service, proto, domain string) (err error) {
 	c.endpoints = make([]string, len(urls))
 	for i := range urls {
 		c.endpoints[i] = urls[i].String()
-		//strings.TrimSuffix(".", urls[i].String())
 	}
-	//c.endpoints = []string{"https://etcd00.dev02.local:2379/v2/keys/"}
-	fmt.Println(c.endpoints)
+	fmt.Println("endpoints: ", c.endpoints)
 
 	return
 }
 
 //GetHTTPTransport http transport for the cert and key
-func (c *Client) GetHTTPTransport(cert, key string) (err error) {
-	if cert == "" || key == "" {
+func (c *Client) GetHTTPTransport(certFilePath, keyFilePath string) (err error) {
+	if certFilePath == "" || keyFilePath == "" {
 		return errors.New("Require both cert and key path")
 	}
+
+	// Check if the cert and key files exists
+	if _, err = os.Stat(certFilePath); os.IsNotExist(err) {
+		return fmt.Errorf("Cert file %s does not exist", certFilePath)
+	}
+
+	if _, err = os.Stat(keyFilePath); os.IsNotExist(err) {
+		return fmt.Errorf("Key file %s does not exist", keyFilePath)
+	}
+
 	fmt.Println("publicKeyTest start")
-	tlsCert, err := tls.LoadX509KeyPair(cert, key)
-	certx509, _ := ioutil.ReadFile(cert)
+	tlsCert, err := tls.LoadX509KeyPair(certFilePath, keyFilePath)
+	if err != nil {
+		return
+	}
+	certx509, _ := ioutil.ReadFile(certFilePath)
 
 	block, _ := pem.Decode([]byte(certx509))
 	certTest, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		fmt.Println(err)
+		return
 	}
 
 	privateKeyTest := tlsCert.PrivateKey
@@ -77,10 +91,6 @@ func (c *Client) GetHTTPTransport(cert, key string) (err error) {
 	c.entity.PrivateKey.PublicKey.PubKeyAlgo = 1
 	c.entity.PrivateKey.PublicKey.PublicKey = (certTest.PublicKey).(*rsa.PublicKey)
 
-	//fmt.Println("privateKeyTest: ", privateKeyTest)
-	if err != nil {
-		return err
-	}
 	tlsConfig := &tls.Config{
 		Certificates:       []tls.Certificate{tlsCert},
 		InsecureSkipVerify: true,
@@ -97,10 +107,16 @@ func (c *Client) GetHTTPTransport(cert, key string) (err error) {
 }
 
 // NewClient does...
-func NewClient(service, proto, domain, cert, key string) {
+func NewClient(service, proto, domain, cert, key string) (err error) {
 	c := &Client{}
-	c.GetEndpoints(service, proto, domain)
-	c.GetHTTPTransport(cert, key)
+	err = c.GetEndpoints(service, proto, domain)
+	if err != nil {
+		return
+	}
+	err = c.GetHTTPTransport(cert, key)
+	if err != nil {
+		return
+	}
 	cfg := client.Config{
 		Endpoints: c.endpoints,
 		Transport: c.httpTransport,
@@ -109,41 +125,46 @@ func NewClient(service, proto, domain, cert, key string) {
 	}
 	cli, err := client.New(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
 	kapi := client.NewKeysAPI(cli)
-
 	resp, err := kapi.Get(context.Background(), "/TestEtcd/461046A0297D5848D5510BE07A37D03F6180BF17/Foo", nil)
 	if err != nil {
-		log.Fatal(err)
-	} else {
+		return
+	}
+	if resp != nil {
 		// print common key info
 		fmt.Printf("Get is done. Metadata is %q\n", resp)
 		//fmt.Println("pgp value: ", resp.Node.Value)
 		// print value
-		fmt.Printf("%q key has %q value\n", resp.Node.Key, DecryptValue(resp.Node.Value, key, c.entity))
+		value, err := DecryptValue(resp.Node.Value, key, c.entity)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%q key has %q value\n", resp.Node.Key, value)
 	}
+
+	return
 }
 
-// DecryptValue does...
-func DecryptValue(encryptedMessage string, privateKey string, entity *openpgp.Entity) string {
+// DecryptValue decrypts the pgp key using the entitylist
+func DecryptValue(encryptedMessage string, privateKey string, entity *openpgp.Entity) (decStr string, err error) {
 
 	testenlist := make(openpgp.EntityList, 1)
 	testenlist[0] = entity
-	//fmt.Println("encryptedMessage: ", encryptedMessage)
 	btest := bytes.NewBuffer([]byte(encryptedMessage))
 	// Decrypt it with the contents of the private key
 	md, err := openpgp.ReadMessage(btest, testenlist, nil, nil)
 	if err != nil {
-		//return "", err
+		return
 	}
 	fmt.Println("after read:", md)
 	bytes, err := ioutil.ReadAll(md.UnverifiedBody)
 	if err != nil {
-		//return "", err
+		return
 	}
-	decStr := string(bytes)
+	decStr = string(bytes)
 	fmt.Println("decStr: ", decStr)
 
-	return decStr
+	return
 }
